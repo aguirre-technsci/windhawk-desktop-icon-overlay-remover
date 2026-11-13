@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              desktop-icon-overlay-remover
 // @name            Desktop Icon Overlay Remover
-// @description     Remove a seta de atalho e os ícones de sincronização do OneDrive somente na Área de Trabalho (o Explorador de Arquivos não é afetado)
-// @version         1.1
+// @description     Remove a seta de atalho, os ícones de sincronização do OneDrive e o escudo de administrador somente na Área de Trabalho (o Explorador de Arquivos não é afetado)
+// @version         1.2
 // @author          aguirre-technsci, Claude (Anthropic)
 // @github          https://github.com/aguirre-technsci
 // @include         explorer.exe
@@ -13,14 +13,19 @@
 
 // ==WindhawkModReadme==
 /*
+
+Author: [aguirre-technsci](https://github.com/aguirre-technsci), co-authored
+with Claude (Anthropic).
+
 # Desktop Icon Overlay Remover
 
 Remove os ícones sobrepostos (overlays) dos ícones da **Área de Trabalho**:
 
 - a seta de atalho;
 - os ícones de sincronização do OneDrive (nuvem, check verde, setas de
-  sincronização, erro, bloqueado, compartilhado), útil quando a Área de
-  Trabalho está dentro do OneDrive.
+  sincronização, erro, bloqueado, compartilhado);
+- o escudo de administrador (UAC);
+- qualquer outro overlay, no modo "Remover todos os overlays".
 
 Janelas do Explorador de Arquivos e diálogos Abrir/Salvar continuam normais.
 Cada remoção pode ser ligada ou desligada nas configurações do mod.
@@ -29,26 +34,37 @@ Cada remoção pode ser ligada ou desligada nas configurações do mod.
 
 A Área de Trabalho é uma `SHELLDLL_DefView` filha de `Progman` ou `WorkerW`. O
 mod faz subclass só dessa janela e, depois que o tratamento original de
-`LVN_GETDISPINFOW` roda, zera os bits de overlay (`LVIS_OVERLAYMASK`) quando o
-índice de overlay é um dos escolhidos:
+`LVN_GETDISPINFOW` roda, zera os bits de overlay (`LVIS_OVERLAYMASK`).
 
-- seta de atalho: `SHGetIconOverlayIndexW(NULL, IDO_SHGIOI_LINK)`;
-- OneDrive: o mod lê os handlers registrados em
-  `ShellIconOverlayIdentifiers` cujo nome contém `OneDrive` ou `SkyDrive`,
-  pergunta a cada um qual ícone ele usa (`IShellIconOverlayIdentifier::
-  GetOverlayInfo`) e converte para o índice de overlay do sistema.
+Dois modos de escolher o que remover:
 
-Outros overlays (de outros programas) ficam intactos. Nada é gravado no
-registro; ao desativar o mod, a subclass é removida e a Área de Trabalho é
-repintada.
+- **Remover todos os overlays** (padrão): zera qualquer overlay. Não depende de
+  identificar qual programa criou o overlay, então pega sincronização do
+  OneDrive, escudo de administrador, seta e o que mais aparecer.
+- **Seletivo** (se o modo acima estiver desligado):
+  - seta de atalho: `SHGetIconOverlayIndexW(NULL, IDO_SHGIOI_LINK)`;
+  - OneDrive: o mod lê os handlers registrados em `ShellIconOverlayIdentifiers`
+    cujo nome contém `OneDrive` ou `SkyDrive`, pergunta a cada um qual ícone ele
+    usa (`IShellIconOverlayIdentifier::GetOverlayInfo`) e converte para o índice
+    de overlay do sistema. Esse caminho depende de o handler responder como o mod
+    espera; se algum ícone sobrar, use o modo "todos".
+
+Nada é gravado no registro; ao desativar o mod, a subclass é removida e a Área
+de Trabalho é repintada.
+
+## Diagnóstico
+
+Na aba de log do Windhawk, cada índice de overlay removido aparece uma vez
+("Overlay N removido"). Se um ícone continuar na tela e nenhuma linha nova
+aparecer, ele não passa por este caminho; envie o log.
 
 ## Limitações conhecidas
 
 - Com ícones da Área de Trabalho muito grandes (Ctrl + roda do mouse), o
   Windows pode desenhar o overlay por outro caminho e o ícone pode continuar
   aparecendo. Teste nesse tamanho.
-- Os handlers do OneDrive são lidos ao carregar o mod. Se o OneDrive for
-  instalado ou atualizado depois, desative e ative o mod.
+- No modo seletivo, os handlers do OneDrive são lidos ao carregar o mod. Se o
+  OneDrive for instalado ou atualizado depois, desative e ative o mod.
 - Testar após ativar com o Explorer rodando, após reiniciar o Explorer e após
   reiniciar o PC.
 */
@@ -56,12 +72,15 @@ repintada.
 
 // ==WindhawkModSettings==
 /*
+- RemoveAllOverlays: true
+  $name: Remover todos os overlays (recomendado)
+  $description: Remove qualquer ícone sobreposto dos ícones da Área de Trabalho, incluindo sincronização do OneDrive e o escudo de administrador. Quando ligado, as duas opções abaixo ficam sem efeito.
 - RemoveShortcutArrow: true
   $name: Remover a seta de atalho
-  $description: Remove a seta de atalho dos ícones da Área de Trabalho
+  $description: Modo seletivo. Remove a seta de atalho dos ícones da Área de Trabalho
 - RemoveOneDriveOverlays: true
   $name: Remover ícones de sincronização do OneDrive
-  $description: Remove nuvem, check verde, setas de sincronização e similares dos ícones da Área de Trabalho
+  $description: Modo seletivo. Remove nuvem, check verde, setas de sincronização e similares dos ícones da Área de Trabalho
 */
 // ==/WindhawkModSettings==
 
@@ -83,11 +102,14 @@ std::mutex g_mutex;
 std::vector<HWND> g_subclassed;  // janelas SHELLDLL_DefView da Área de Trabalho
 HANDLE g_resolveThread = nullptr;  // thread que resolve os overlays do OneDrive
 
+std::atomic<bool> g_removeAll{true};
 std::atomic<bool> g_removeArrow{true};
 std::atomic<bool> g_removeOneDrive{true};
 std::atomic<int> g_linkOverlayIndex{-1};  // índice (base 1) do overlay de atalho
 // Bit N ligado = o overlay de índice N (1..15) pertence ao OneDrive.
 std::atomic<uint32_t> g_oneDriveOverlayMask{0};
+// Bit N ligado = o overlay N já foi registrado no log (uma linha por índice).
+std::atomic<uint32_t> g_loggedOverlays{0};
 
 // Interface IShellIconOverlayIdentifier (IID 0C6C4200-C589-11D0-999A-00C04FD655E1),
 // declarada aqui para não depender dos cabeçalhos do toolchain.
@@ -113,6 +135,7 @@ constexpr DWORD kIconIndexFlag = 0x2;  // ISIOI_ICONINDEX
 // --- utilidades ------------------------------------------------------------
 
 void LoadSettings() {
+    g_removeAll = Wh_GetIntSetting(L"RemoveAllOverlays") != 0;
     g_removeArrow = Wh_GetIntSetting(L"RemoveShortcutArrow") != 0;
     g_removeOneDrive = Wh_GetIntSetting(L"RemoveOneDriveOverlays") != 0;
 }
@@ -170,7 +193,7 @@ void RefreshAllDesktopViews() {
     }
 }
 
-// --- overlays do OneDrive -----------------------------------------------------
+// --- overlays do OneDrive (modo seletivo) ---------------------------------------
 
 // Lê os handlers de overlay do OneDrive/SkyDrive registrados no sistema e
 // devolve a máscara de bits com os índices de overlay deles. Precisa rodar em
@@ -303,7 +326,10 @@ void StripOverlays(NMLVDISPINFOW* di) {
     }
 
     bool strip = false;
-    if (g_removeArrow.load() && overlay == g_linkOverlayIndex.load()) {
+    if (g_removeAll.load()) {
+        // Sincronização, escudo de administrador, seta e qualquer outro.
+        strip = true;
+    } else if (g_removeArrow.load() && overlay == g_linkOverlayIndex.load()) {
         strip = true;
     } else if (g_removeOneDrive.load() && overlay < 32 &&
                ((g_oneDriveOverlayMask.load() >> overlay) & 1u)) {
@@ -312,6 +338,14 @@ void StripOverlays(NMLVDISPINFOW* di) {
 
     if (strip) {
         di->item.state &= ~static_cast<UINT>(LVIS_OVERLAYMASK);
+
+        // Uma linha de log por índice, para diagnóstico.
+        if (overlay < 32) {
+            uint32_t bit = 1u << overlay;
+            if (!(g_loggedOverlays.fetch_or(bit) & bit)) {
+                Wh_Log(L"Overlay %d removido", overlay);
+            }
+        }
     }
 }
 
@@ -448,8 +482,8 @@ BOOL Wh_ModInit() {
 
 void Wh_ModAfterInit() {
     Wh_Log(L">");
-    // Resolve os overlays do OneDrive em segundo plano e anexa à Área de
-    // Trabalho, que já existe se o Explorer estava rodando.
+    // Resolve os overlays do OneDrive em segundo plano (modo seletivo) e anexa
+    // à Área de Trabalho, que já existe se o Explorer estava rodando.
     StartResolveOneDrive();
     AttachToExistingDesktop();
 }
@@ -457,7 +491,8 @@ void Wh_ModAfterInit() {
 void Wh_ModSettingsChanged() {
     Wh_Log(L">");
     LoadSettings();
-    StartResolveOneDrive();  // não faz nada se já está rodando
+    g_loggedOverlays.store(0);  // novo log de diagnóstico após mudar a config
+    StartResolveOneDrive();     // não faz nada se já está rodando
     RefreshAllDesktopViews();
 }
 
